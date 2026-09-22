@@ -648,10 +648,10 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
                          (uint32_t)s.debug_view);
 }
 
-// Called after every successful game DLSS-SR evaluate, on the game's own command list.
+// Called after every successful game DLSS-SR or DLSS-RR evaluate, on the game's own command list.
 inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
   if (s.gave_up || cmd == nullptr || game_params == nullptr) return;
-  if (s.out_w == 0 || s.out_h == 0) return;  // no DLSS-SR create seen yet
+  if (s.out_w == 0 || s.out_h == 0) return;  // no DLSS-SR or DLSS-RR create seen yet
 
   TickGraveyard();
   if (s.retire_pending.exchange(false, std::memory_order_relaxed))

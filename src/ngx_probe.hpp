@@ -218,12 +218,19 @@ constexpr uint32_t kHeartbeatEvery = 600;
 // The Reserved18 handle, so evaluates of the NR feature get their own dump.
 inline NVSDK_NGX_Handle* nr_handle = nullptr;
 
-// Which feature each live handle was created as. Only an evaluate of a DLSS Super
-// Resolution handle (SR, and DLAA, which is SR at 1:1) is a frame the NR pass may run
-// after. Frame Generation (feature 11) evaluates through the same entry point, on its
-// own command list and at its own point in the frame, and engines such as Unreal reuse
-// one parameter block, so its parameters still name the SR output, depth and motion:
-// running the NR pass there crashed the game the moment Frame Generation was enabled.
+// True for the DLSS features whose output is the game's upscaled frame: Super Resolution (and
+// DLAA, which is SR at 1:1), and Ray Reconstruction, which is SR with the denoiser built in
+// and takes the same geometry, output, depth and motion parameters.
+inline bool IsUpscaler(NVSDK_NGX_Feature id) {
+  return id == NVSDK_NGX_Feature_SuperSampling || id == NVSDK_NGX_Feature_RayReconstruction;
+}
+
+// Which feature each live handle was created as. Only an evaluate of an upscaler handle
+// (IsUpscaler) is a frame the NR pass may run after. Frame Generation (feature 11)
+// evaluates through the same entry point, on its own command list and at its own point in
+// the frame, and engines such as Unreal reuse one parameter block, so its parameters still
+// name the SR output, depth and motion: running the NR pass there crashed the game the
+// moment Frame Generation was enabled.
 inline std::mutex feature_handles_mutex;
 inline std::unordered_map<const NVSDK_NGX_Handle*, NVSDK_NGX_Feature> feature_handles;
 
@@ -234,7 +241,7 @@ inline std::unordered_map<const NVSDK_NGX_Handle*, NVSDK_NGX_Feature> feature_ha
 inline bool RunsNrAfter(const NVSDK_NGX_Handle* handle) {
   std::lock_guard<std::mutex> lock(feature_handles_mutex);
   const auto it = feature_handles.find(handle);
-  return it == feature_handles.end() || it->second == NVSDK_NGX_Feature_SuperSampling;
+  return it == feature_handles.end() || IsUpscaler(it->second);
 }
 
 static decltype(&NVSDK_NGX_D3D12_CreateFeature) real_D3D12_CreateFeature = nullptr;
@@ -258,8 +265,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12CreateFeature(
     nr_handle = *out_handle;
     Log("ngx-probe: Reserved18 (DLSS-NR) handle captured — evals will be dumped");
   }
-  if (feature_id == NVSDK_NGX_Feature_SuperSampling && result == NVSDK_NGX_Result_Success &&
-      params != nullptr) {
+  if (IsUpscaler(feature_id) && result == NVSDK_NGX_Result_Success && params != nullptr) {
     unsigned w = 0, h = 0, ow = 0, oh = 0;
     int flags = 0;
     params->Get(NVSDK_NGX_Parameter_Width, &w);
