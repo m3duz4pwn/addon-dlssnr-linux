@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
+#include <mutex>
+#include <unordered_map>
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -216,6 +218,25 @@ constexpr uint32_t kHeartbeatEvery = 600;
 // The Reserved18 handle, so evaluates of the NR feature get their own dump.
 inline NVSDK_NGX_Handle* nr_handle = nullptr;
 
+// Which feature each live handle was created as. Only an evaluate of a DLSS Super
+// Resolution handle (SR, and DLAA, which is SR at 1:1) is a frame the NR pass may run
+// after. Frame Generation (feature 11) evaluates through the same entry point, on its
+// own command list and at its own point in the frame, and engines such as Unreal reuse
+// one parameter block, so its parameters still name the SR output, depth and motion:
+// running the NR pass there crashed the game the moment Frame Generation was enabled.
+inline std::mutex feature_handles_mutex;
+inline std::unordered_map<const NVSDK_NGX_Handle*, NVSDK_NGX_Feature> feature_handles;
+
+// True when the NR pass may run after this evaluate. Only a handle recorded as some other
+// feature is refused. A handle created before these hooks were installed is unknown and
+// still runs, as before: requiring a recorded SR handle would stop the pass for good in a
+// game whose SR was created early (issue #7) the moment it created Frame Generation.
+inline bool RunsNrAfter(const NVSDK_NGX_Handle* handle) {
+  std::lock_guard<std::mutex> lock(feature_handles_mutex);
+  const auto it = feature_handles.find(handle);
+  return it == feature_handles.end() || it->second == NVSDK_NGX_Feature_SuperSampling;
+}
+
 static decltype(&NVSDK_NGX_D3D12_CreateFeature) real_D3D12_CreateFeature = nullptr;
 inline NVSDK_NGX_Result NVSDK_CONV HookD3D12CreateFeature(
     ID3D12GraphicsCommandList* cmd_list, NVSDK_NGX_Feature feature_id,
@@ -227,6 +248,11 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12CreateFeature(
   const auto result = real_D3D12_CreateFeature(cmd_list, feature_id, params, out_handle);
   Logf("ngx-probe: D3D12_CreateFeature => 0x%x handle=%p", static_cast<unsigned>(result),
        (out_handle != nullptr) ? static_cast<void*>(*out_handle) : nullptr);
+  if (result == NVSDK_NGX_Result_Success && out_handle != nullptr && *out_handle != nullptr &&
+      feature_id != NVSDK_NGX_Feature_Reserved18) {
+    std::lock_guard<std::mutex> lock(feature_handles_mutex);
+    feature_handles[*out_handle] = feature_id;
+  }
   if (feature_id == NVSDK_NGX_Feature_Reserved18 && result == NVSDK_NGX_Result_Success &&
       out_handle != nullptr) {
     nr_handle = *out_handle;
@@ -271,7 +297,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12EvaluateFeature(
     Logf("ngx-probe: D3D12_EvaluateFeature #%u (alive)", n);
   }
   const auto eval_result = real_D3D12_EvaluateFeature(cmd_list, handle, params, callback);
-  if (eval_result == NVSDK_NGX_Result_Success)
+  if (eval_result == NVSDK_NGX_Result_Success && RunsNrAfter(handle))
     nr_runner::OnDlssEvaluated(cmd_list, params);
   return eval_result;
 }
@@ -279,6 +305,10 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12EvaluateFeature(
 static decltype(&NVSDK_NGX_D3D12_ReleaseFeature) real_D3D12_ReleaseFeature = nullptr;
 inline NVSDK_NGX_Result NVSDK_CONV HookD3D12ReleaseFeature(NVSDK_NGX_Handle* handle) {
   Logf("ngx-probe: D3D12_ReleaseFeature handle=%p", static_cast<void*>(handle));
+  {
+    std::lock_guard<std::mutex> lock(feature_handles_mutex);
+    feature_handles.erase(handle);
+  }
   return real_D3D12_ReleaseFeature(handle);
 }
 
