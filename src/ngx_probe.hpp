@@ -318,6 +318,27 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12ReleaseFeature(NVSDK_NGX_Handle* han
   return real_D3D12_ReleaseFeature(handle);
 }
 
+// NGX shutting down takes the capability block and the core our NR feature was built on with it,
+// so the runner drops everything first, while both are still alive (nr_runner::ResetSession).
+// NVSDK_NGX_D3D12_Shutdown sits behind NGX_ENABLE_DEPRECATED_SHUTDOWN in the SDK header, so both
+// signatures are spelled out rather than taken with decltype.
+using PFN_D3D12_Shutdown = NVSDK_NGX_Result(NVSDK_CONV*)();
+using PFN_D3D12_Shutdown1 = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12Device*);
+
+static PFN_D3D12_Shutdown real_D3D12_Shutdown = nullptr;
+inline NVSDK_NGX_Result NVSDK_CONV HookD3D12Shutdown() {
+  Log("ngx-probe: D3D12_Shutdown");
+  nr_runner::OnNgxShutdown("NGX is shutting down (D3D12_Shutdown)");
+  return real_D3D12_Shutdown();
+}
+
+static PFN_D3D12_Shutdown1 real_D3D12_Shutdown1 = nullptr;
+inline NVSDK_NGX_Result NVSDK_CONV HookD3D12Shutdown1(ID3D12Device* device) {
+  Logf("ngx-probe: D3D12_Shutdown1(device=%p)", static_cast<void*>(device));
+  nr_runner::OnNgxShutdown("NGX is shutting down (D3D12_Shutdown1)");
+  return real_D3D12_Shutdown1(device);
+}
+
 static decltype(&NVSDK_NGX_D3D11_CreateFeature) real_D3D11_CreateFeature = nullptr;
 inline NVSDK_NGX_Result NVSDK_CONV HookD3D11CreateFeature(
     ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feature_id,
@@ -355,6 +376,8 @@ inline const HookEntry kHooks[] = {
     {"NVSDK_NGX_D3D12_CreateFeature", reinterpret_cast<void**>(&real_D3D12_CreateFeature), reinterpret_cast<void*>(&HookD3D12CreateFeature)},
     {"NVSDK_NGX_D3D12_EvaluateFeature", reinterpret_cast<void**>(&real_D3D12_EvaluateFeature), reinterpret_cast<void*>(&HookD3D12EvaluateFeature)},
     {"NVSDK_NGX_D3D12_ReleaseFeature", reinterpret_cast<void**>(&real_D3D12_ReleaseFeature), reinterpret_cast<void*>(&HookD3D12ReleaseFeature)},
+    {"NVSDK_NGX_D3D12_Shutdown", reinterpret_cast<void**>(&real_D3D12_Shutdown), reinterpret_cast<void*>(&HookD3D12Shutdown)},
+    {"NVSDK_NGX_D3D12_Shutdown1", reinterpret_cast<void**>(&real_D3D12_Shutdown1), reinterpret_cast<void*>(&HookD3D12Shutdown1)},
     {"NVSDK_NGX_D3D11_CreateFeature", reinterpret_cast<void**>(&real_D3D11_CreateFeature), reinterpret_cast<void*>(&HookD3D11CreateFeature)},
     {"NVSDK_NGX_D3D11_EvaluateFeature", reinterpret_cast<void**>(&real_D3D11_EvaluateFeature), reinterpret_cast<void*>(&HookD3D11EvaluateFeature)},
 };

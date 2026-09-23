@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include <d3d12.h>
@@ -95,6 +96,7 @@ using PFN_FwdInit = int(__cdecl*)(const wchar_t*, const wchar_t*, ID3D12Device*,
 using PFN_FwdCreate = void*(__cdecl*)(ID3D12GraphicsCommandList*, void*, int*);
 using PFN_FwdEvaluate = int(__cdecl*)(ID3D12GraphicsCommandList*, void*, void*);
 using PFN_FwdRelease = void(__cdecl*)(void*);
+using PFN_FwdShutdown = int(__cdecl*)(ID3D12Device*);
 using PFN_GetCapabilityParams = int(__cdecl*)(NVSDK_NGX_Parameter**);
 
 constexpr uint32_t kFullLogs = 3;        // first evals logged in full
@@ -117,6 +119,13 @@ struct State {
   PFN_FwdCreate create = nullptr;
   PFN_FwdEvaluate evaluate = nullptr;
   PFN_FwdRelease release = nullptr;
+  PFN_FwdShutdown shutdown = nullptr;  // absent in forwarders older than the device reset
+
+  // The device every object below was made on. Identity only -- not AddRef'd: holding a
+  // reference would keep the game's (or the DLSS5 feeder's) device alive past its own teardown,
+  // and ReShade only reports a device destroyed when its last reference goes.
+  ID3D12Device* device = nullptr;
+  bool resetting = false;
 
   NVSDK_NGX_Parameter* caps = nullptr;
   bool snippet_inited = false;
@@ -170,6 +179,11 @@ struct State {
 };
 
 inline State s;
+
+// The runner is entered from the game's CreateFeature, EvaluateFeature and Shutdown calls, which
+// an engine may make on different threads, and from the addon's unload. Uncontended in practice
+// (one lock per DLSS evaluate); recursive so a reset reached from inside a hooked call is safe.
+inline std::recursive_mutex mutex;
 
 inline const char* ResultName(int r) {
   switch ((unsigned)r) {
@@ -334,6 +348,7 @@ inline void RetireFeature(const char* why) {
 // Remember the game's DLSS-SR geometry; the NR feature is built against the display resolution and
 // its guides against the render resolution.
 inline void OnDlssCreate(unsigned w, unsigned h, unsigned ow, unsigned oh, int flags) {
+  std::lock_guard<std::recursive_mutex> lock(mutex);
   s.render_w = w;
   s.render_h = h;
   s.out_w = ow;
@@ -345,6 +360,7 @@ inline void OnDlssCreate(unsigned w, unsigned h, unsigned ow, unsigned oh, int f
 
 // Process teardown: pointers in the shared block must not outlive us.
 inline void Shutdown() {
+  std::lock_guard<std::recursive_mutex> lock(mutex);
   if (model_id_thread != nullptr) {
     WaitForSingleObject(model_id_thread, 3000);  // the hash thread must not outlive the DLL
     CloseHandle(model_id_thread);
@@ -372,6 +388,73 @@ inline void Shutdown() {
     g = {};
   }
   nr_compose::Release();
+}
+
+// Everything the runner made belongs to one D3D12 device and one NGX session: the capability
+// block (the driver core's), the snippet's core (initialised on that device with that block),
+// the NR feature, the three textures and the compose pipelines. The game or the DLSS5 feeder can
+// end either -- the feeder shuts NGX down and opens a new private device whenever its session
+// restarts, and some games recreate their device on a display-mode change. Carrying on fed the
+// old device's objects to the new device's command lists and wrote into a freed capability block.
+//
+// So all of it is dropped and rebuilt on the next evaluate. Nothing waits in the graveyard: the
+// NGX shutdown path requires the app to have idled the GPU first, and our work was recorded into
+// the same command lists as its DLSS; on a device change, the old device has stopped being fed.
+// The order matters: features before the snippet's shutdown, resources after it, because our
+// resources are what keep an already-destroyed device's object alive for the shutdown call.
+inline void ResetSession(const char* why) {
+  if (s.resetting) return;
+  const bool built = s.caps != nullptr || s.snippet_inited || s.feature != nullptr ||
+                     s.output != nullptr || !s.graveyard.empty() ||
+                     nr_compose::c.root_sig != nullptr;
+  if (!built && s.device == nullptr) return;
+  s.resetting = true;
+  ngx_probe::Logf("nr-fwd: starting over -- %s", why);
+
+  if (s.feature != nullptr && s.release != nullptr) s.release(s.feature);
+  s.feature = nullptr;
+  for (auto& g : s.graveyard) {
+    if (g.feature != nullptr && s.release != nullptr) s.release(g.feature);
+    g.feature = nullptr;
+  }
+
+  if (s.snippet_inited) {
+    if (s.shutdown != nullptr) {
+      const int result = s.shutdown(s.device);
+      ngx_probe::Logf("nr-fwd: snippet shutdown => 0x%x (%s)", (unsigned)result,
+                      ResultName(result));
+    } else {
+      // An older forwarder answers "already initialised" to the next init, for a core bound to
+      // the old device. Running on that would be the crash this reset exists to prevent.
+      GiveUp("nvngx.dll_nrfwd.dll is too old to re-initialise the model after a device or NGX "
+             "restart -- update it together with the addon");
+    }
+    s.snippet_inited = false;
+  }
+
+  for (auto* r : {s.output, s.color_copy, s.proxy})
+    if (r != nullptr) r->Release();
+  s.output = s.color_copy = s.proxy = nullptr;
+  for (auto& g : s.graveyard)
+    if (g.resource != nullptr) g.resource->Release();
+  s.graveyard.clear();
+  nr_compose::Release();
+
+  s.caps = nullptr;  // the old core's block: dropped, never written again
+  s.device = nullptr;
+  s.output_format = DXGI_FORMAT_UNKNOWN;
+  s.feature_w = s.feature_h = 0;
+  s.fail_streak = 0;
+  s.resetting = false;
+}
+
+// The game (or the feeder) is shutting NGX down, before the real call runs: the core, its
+// capability block and the device are all still alive here. Any shutdown resets, whichever
+// device it names -- the device a caller passes and the one our command lists report can be
+// different wrappers of the same device, and a needless reset costs one feature rebuild.
+inline void OnNgxShutdown(const char* which) {
+  std::lock_guard<std::recursive_mutex> lock(mutex);
+  ResetSession(which);
 }
 
 inline void SetEnabled(bool on) {
@@ -409,6 +492,10 @@ inline bool EnsureSetup(ID3D12GraphicsCommandList* cmd) {
     s.create = (PFN_FwdCreate)GetProcAddress(s.forwarder, "nrfwd_create");
     s.evaluate = (PFN_FwdEvaluate)GetProcAddress(s.forwarder, "nrfwd_evaluate");
     s.release = (PFN_FwdRelease)GetProcAddress(s.forwarder, "nrfwd_release");
+    s.shutdown = (PFN_FwdShutdown)GetProcAddress(s.forwarder, "nrfwd_shutdown");
+    if (s.shutdown == nullptr)
+      ngx_probe::Warnf("nr-fwd: this nvngx.dll_nrfwd.dll predates nrfwd_shutdown; a device or NGX "
+                       "restart will stop the pass for the session");
     if (s.init == nullptr || s.create == nullptr || s.evaluate == nullptr || s.release == nullptr)
       return GiveUp("forwarder exports did not resolve");
     ngx_probe::Log("nr-fwd: forwarder loaded");
@@ -730,8 +817,18 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
 
 // Called after every successful game DLSS-SR or DLSS-RR evaluate, on the game's own command list.
 inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
+  std::lock_guard<std::recursive_mutex> lock(mutex);
   if (s.gave_up || cmd == nullptr || game_params == nullptr) return;
   if (s.out_w == 0 || s.out_h == 0) return;  // no DLSS-SR or DLSS-RR create seen yet
+
+  // A frame from another device than the one everything was built on: start over before any of
+  // the old device's objects can reach this command list.
+  ID3D12Device* device = nullptr;
+  if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return;
+  device->Release();  // identity only, see State::device
+  if (s.device != nullptr && device != s.device)
+    ResetSession("DLSS is now evaluating on a different D3D12 device");
+  if (s.gave_up) return;
 
   TickGraveyard();
   if (s.retire_pending.exchange(false, std::memory_order_relaxed))
@@ -739,6 +836,7 @@ inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Para
   if (!s.enabled) return;
 
   if (!EnsureSetup(cmd)) return;
+  if (s.device == nullptr) s.device = device;
   if (!EnsureFeature(cmd)) return;
   Evaluate(cmd, game_params);
 

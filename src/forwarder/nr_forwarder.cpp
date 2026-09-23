@@ -21,6 +21,7 @@ using PFN_InitExt = int(__cdecl*)(unsigned long long, const wchar_t*, ID3D12Devi
 using PFN_Create = int(__cdecl*)(ID3D12GraphicsCommandList*, int, const void*, void**);
 using PFN_Evaluate = int(__cdecl*)(ID3D12GraphicsCommandList*, const void*, const void*, void*);
 using PFN_Release = int(__cdecl*)(void*);
+using PFN_Shutdown1 = int(__cdecl*)(ID3D12Device*);
 
 struct Snippet {
   HMODULE module = nullptr;
@@ -28,6 +29,7 @@ struct Snippet {
   PFN_Create create = nullptr;
   PFN_Evaluate evaluate = nullptr;
   PFN_Release release = nullptr;
+  PFN_Shutdown1 shutdown = nullptr;
   bool initialised = false;
 };
 
@@ -41,6 +43,7 @@ bool LoadSnippet(const wchar_t* path) {
   g_snip.create = (PFN_Create)GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_CreateFeature");
   g_snip.evaluate = (PFN_Evaluate)GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_EvaluateFeature");
   g_snip.release = (PFN_Release)GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_ReleaseFeature");
+  g_snip.shutdown = (PFN_Shutdown1)GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_Shutdown1");
   return g_snip.create != nullptr && g_snip.evaluate != nullptr;
 }
 
@@ -88,6 +91,19 @@ __declspec(dllexport) void nrfwd_release(void* feature) {
     volatile int ignored = g_snip.release(feature);
     (void)ignored;
   }
+}
+
+// Shuts the snippet's NGX core down for one device, so the next nrfwd_init initialises it again
+// -- against a new device, or against the driver core's new capability block after the game
+// restarted NGX. Without this, nrfwd_init answered "already initialised" for a core bound to a
+// device and block that no longer existed. Shutdown1 carries the same caller gate as the rest.
+// Returns the snippet's result (1 = success), or 0 when there was nothing to shut down.
+__declspec(dllexport) int nrfwd_shutdown(ID3D12Device* device) {
+  if (!g_snip.initialised) return 0;
+  g_snip.initialised = false;
+  if (g_snip.shutdown == nullptr) return 0;
+  volatile int result = g_snip.shutdown(device);
+  return result;
 }
 
 }  // extern "C"
