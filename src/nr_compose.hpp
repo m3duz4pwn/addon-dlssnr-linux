@@ -34,6 +34,7 @@ namespace nr_compose {
 constexpr uint32_t kRingSize = 8;        // frames of descriptor tables in flight
 constexpr uint32_t kSlotsPerFrame = 12;  // see the slot map in RecordPre/RecordPost
 constexpr uint32_t kReadbackRing = 4;    // frames the measurement is allowed to lag
+constexpr uint32_t kRootConstants = 9;   // sizeof(Params) / 4
 
 struct Compose {
   ID3D12RootSignature* root_sig = nullptr;
@@ -97,7 +98,7 @@ inline bool MakePso(ID3D12Device* device, const unsigned char* dxil, size_t size
   return SUCCEEDED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(out)));
 }
 
-// Root signature: [0] SRV table t0-t1, [1] UAV table u0, [2] seven root constants b0.
+// Root signature: [0] SRV table t0-t1, [1] UAV table u0, [2] nine root constants b0.
 inline bool Init(ID3D12Device* device) {
   if (c.root_sig != nullptr) return true;
   if (c.failed) return false;
@@ -122,7 +123,7 @@ inline bool Init(ID3D12Device* device) {
   params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   params[2].Constants.ShaderRegister = 0;
-  params[2].Constants.Num32BitValues = 7;
+  params[2].Constants.Num32BitValues = kRootConstants;
   params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC desc = {};
@@ -215,11 +216,12 @@ inline bool EnsureBuffers(ID3D12Device* device, uint32_t w, uint32_t h) {
 // --- helpers -------------------------------------------------------------
 
 inline void Barrier(ID3D12GraphicsCommandList* cmd, ID3D12Resource* res,
-                    D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+                    D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to,
+                    UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
   D3D12_RESOURCE_BARRIER b = {};
   b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   b.Transition.pResource = res;
-  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  b.Transition.Subresource = subresource;
   b.Transition.StateBefore = from;
   b.Transition.StateAfter = to;
   cmd->ResourceBarrier(1, &b);
@@ -284,7 +286,14 @@ struct Params {
   uint32_t debug;
   uint32_t width;
   uint32_t height;
+  uint32_t out_x;
+  uint32_t out_y;
 };
+static_assert(sizeof(Params) == kRootConstants * 4, "root constants and Params disagree");
+
+// The game's output is only ever touched at mip 0 / slice 0, the subresource DLSS writes; any
+// other subresource is in whatever state the game left it, which is not ours to assume.
+constexpr UINT kGameSub = 0;
 
 inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, uint32_t srv_slot,
                      uint32_t uav_slot, const Params& p, uint32_t groups_x, uint32_t groups_y) {
@@ -293,7 +302,7 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
   cmd->SetPipelineState(pso);
   cmd->SetComputeRootDescriptorTable(0, SlotAt(srv_slot).gpu);
   cmd->SetComputeRootDescriptorTable(1, SlotAt(uav_slot).gpu);
-  cmd->SetComputeRoot32BitConstants(2, 7, &p, 0);
+  cmd->SetComputeRoot32BitConstants(2, kRootConstants, &p, 0);
   cmd->Dispatch(groups_x, groups_y, 1);
 }
 
@@ -304,18 +313,20 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
 //   2    UAV proxy             (encode)
 //   3    UAV tile_buf          (lum1)
 //   4-5  SRV colorCopy, model  (resolve t0-t1)
-//   6    UAV game output       (resolve)
+//   6    UAV game output       (resolve; writes at the output subrect's base)
 //   7-8  SRV tile_buf x2       (lum2 t0-t1)
 //   9    UAV result_buf        (lum2)
 //
 // Persistent states between frames: colorCopy, proxy, modelOut, tile_buf, result_buf all
 // UNORDERED_ACCESS; the game's output is in UNORDERED_ACCESS around DLSS evaluation.
 
-// Copy the original aside, encode the proxy, and record the luminance measurement. Leaves:
-// game_out COPY_SOURCE, colorCopy and proxy NON_PIXEL_SHADER_RESOURCE (ready for the model).
+// Copy the original aside, encode the proxy, and record the luminance measurement. The w x h
+// region at (out_x, out_y) of game_out is what DLSS wrote; the texture itself may be larger (a
+// pooled render target). Leaves: game_out COPY_SOURCE, colorCopy and proxy
+// NON_PIXEL_SHADER_RESOURCE (ready for the model).
 inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
                       ID3D12Resource* color_copy, ID3D12Resource* proxy, uint32_t w, uint32_t h,
-                      uint32_t frame, float white_point) {
+                      uint32_t out_x, uint32_t out_y, uint32_t frame, float white_point) {
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return false;
   if (!Init(device) || !EnsureBuffers(device, w, h)) {
@@ -336,11 +347,23 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
   WriteBufferSrv(device, base + 8, c.tile_buf, c.tile_count, 8);
   WriteBufferUav(device, base + 9, c.result_buf, 1, 4);
 
-  Params p = {0.0f, 0.0f, 0.0f, white_point, 0, w, h};
+  Params p = {0.0f, 0.0f, 0.0f, white_point, 0, w, h, out_x, out_y};
 
-  Barrier(cmd, game_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  Barrier(cmd, game_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE,
+          kGameSub);
   Barrier(cmd, color_copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-  cmd->CopyResource(color_copy, game_out);
+  // A region copy, not CopyResource: that requires both textures to be the same size, and the
+  // game's is only guaranteed to be at least the output size.
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = color_copy;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = game_out;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex = kGameSub;
+  const D3D12_BOX box = {out_x, out_y, 0, out_x + w, out_y + h, 1};
+  cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
   Barrier(cmd, color_copy, D3D12_RESOURCE_STATE_COPY_DEST,
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -369,9 +392,9 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
 // Resolve the model's answer over the game's output and restore every state for the next frame.
 inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
                        ID3D12Resource* color_copy, ID3D12Resource* proxy,
-                       ID3D12Resource* model_out, uint32_t w, uint32_t h, uint32_t frame,
-                       float transfer, float max_ratio, float colour, float white_point,
-                       uint32_t debug) {
+                       ID3D12Resource* model_out, uint32_t w, uint32_t h, uint32_t out_x,
+                       uint32_t out_y, uint32_t frame, float transfer, float max_ratio,
+                       float colour, float white_point, uint32_t debug) {
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return;
 
@@ -382,9 +405,10 @@ inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
 
   Barrier(cmd, model_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  Barrier(cmd, game_out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  Barrier(cmd, game_out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+          kGameSub);
 
-  Params p = {transfer, max_ratio, colour, white_point, debug, w, h};
+  Params p = {transfer, max_ratio, colour, white_point, debug, w, h, out_x, out_y};
   Dispatch(cmd, c.resolve_pso, base + 4, base + 6, p, (w + 7) / 8, (h + 7) / 8);
 
   Barrier(cmd, model_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,

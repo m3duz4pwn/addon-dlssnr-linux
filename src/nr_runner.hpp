@@ -311,17 +311,23 @@ inline void TickGraveyard() {
   }
 }
 
-inline void RetireFeature(const char* why) {
-  if (s.feature == nullptr && s.output == nullptr) return;
-  ngx_probe::Logf("nr-fwd: retiring NR feature (%s)", why);
-  Bury(s.output, s.feature);
+// The three textures alone: they follow the game's output format, the feature does not.
+inline void RetireTextures() {
+  Bury(s.output, nullptr);
   Bury(s.color_copy, nullptr);
   Bury(s.proxy, nullptr);
-  s.feature = nullptr;
   s.output = nullptr;
   s.color_copy = nullptr;
   s.proxy = nullptr;
   s.output_format = DXGI_FORMAT_UNKNOWN;
+}
+
+inline void RetireFeature(const char* why) {
+  if (s.feature == nullptr && s.output == nullptr) return;
+  ngx_probe::Logf("nr-fwd: retiring NR feature (%s)", why);
+  Bury(nullptr, s.feature);
+  s.feature = nullptr;
+  RetireTextures();
   s.feature_w = s.feature_h = 0;
 }
 
@@ -449,7 +455,7 @@ inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-  // colorCopy must match the game's output format exactly (CopyResource); the proxy and the
+  // colorCopy must match the game's output format exactly (the region copy); the proxy and the
   // model's answer go FP16 -- R11G11B10's 5-bit blue mantissa rounds the encode toward green.
   struct {
     ID3D12Resource** texture;
@@ -546,11 +552,67 @@ inline bool EnsureFeature(ID3D12GraphicsCommandList* cmd) {
 // with the original picture untouched.
 inline void AbortAfterPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out) {
   nr_compose::Barrier(cmd, game_out, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nr_compose::kGameSub);
   nr_compose::Barrier(cmd, s.color_copy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   nr_compose::Barrier(cmd, s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+inline bool IsTypeless(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Why the game's output texture cannot take this frame's pass, or nullptr when it can. The size
+// DLSS was created with says nothing about the texture it is handed each frame: engines pass
+// pooled render targets larger than the output (Unreal keeps the largest size it has seen), a
+// game can switch HDR on without recreating DLSS, and a second DLSS feature at another size
+// evaluates through the same hook. Copying or writing past such a texture's edge is an invalid
+// call on the game's own command list.
+inline const char* OutputUnusable(const D3D12_RESOURCE_DESC& d, unsigned x, unsigned y) {
+  if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "not a 2D texture";
+  if (d.DepthOrArraySize != 1) return "a texture array";
+  if (d.SampleDesc.Count != 1) return "multisampled";
+  if ((d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) return "not writable (no UAV)";
+  if (IsTypeless(d.Format)) return "a typeless format";
+  if (d.Width < (UINT64)x + s.out_w || d.Height < y + s.out_h)
+    return "smaller than the DLSS output at its subrect";
+  return nullptr;
+}
+
+// Logged once per distinct texture shape, so a game that alternates two DLSS features does not
+// fill the log at the frame rate.
+inline void LogSkippedOutput(const D3D12_RESOURCE_DESC& d, unsigned x, unsigned y,
+                             const char* why) {
+  static UINT64 last_w = 0;
+  static UINT last_h = 0, last_x = ~0u, last_y = ~0u;
+  static DXGI_FORMAT last_format = DXGI_FORMAT_UNKNOWN;
+  if (d.Width == last_w && d.Height == last_h && x == last_x && y == last_y &&
+      d.Format == last_format)
+    return;
+  last_w = d.Width;
+  last_h = d.Height;
+  last_x = x;
+  last_y = y;
+  last_format = d.Format;
+  ngx_probe::Warnf(
+      "nr-fwd: skipping frames whose DLSS output texture is %llux%u format=%u (%s); the DLSS "
+      "output is %ux%u at (%u,%u)",
+      (unsigned long long)d.Width, d.Height, (unsigned)d.Format, why, s.out_w, s.out_h, x, y);
 }
 
 inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
@@ -564,6 +626,23 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   game_params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion);
   if (color == nullptr || depth == nullptr || motion == nullptr) return;
 
+  // Checked every frame: GetDesc and two parameter reads are cheap next to the pass itself.
+  const D3D12_RESOURCE_DESC game_desc = color->GetDesc();
+  unsigned out_x = 0, out_y = 0;
+  game_params->Get(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, &out_x);
+  game_params->Get(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, &out_y);
+  if (const char* why = OutputUnusable(game_desc, out_x, out_y)) {
+    LogSkippedOutput(game_desc, out_x, out_y, why);
+    return;
+  }
+  // The copy of the original has to be in the game's format; HDR toggled in the menu changes it
+  // under a feature that stays. The textures are rebuilt, the feature is kept.
+  if (s.output != nullptr && game_desc.Format != s.output_format) {
+    ngx_probe::Logf("nr-fwd: the game's output format changed %u -> %u; rebuilding textures",
+                    (unsigned)s.output_format, (unsigned)game_desc.Format);
+    RetireTextures();
+  }
+
   if (!CreateTextures(cmd, color)) return;
 
   // Fold the latest luminance reading into the smoothed white point. The reading lags a few
@@ -576,8 +655,8 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
   wp = (wp < 0.01f ? 0.01f : (wp > 1000.0f ? 1000.0f : wp)) * s.wp_scale;
 
   // Copy the original aside, encode the display-referred proxy, record the measurement.
-  if (!nr_compose::RecordPre(cmd, color, s.color_copy, s.proxy, s.out_w, s.out_h, s.eval_count,
-                             wp)) {
+  if (!nr_compose::RecordPre(cmd, color, s.color_copy, s.proxy, s.out_w, s.out_h, out_x, out_y,
+                             s.eval_count, wp)) {
     GiveUp("compose pipeline initialisation failed");
     return;
   }
@@ -644,8 +723,8 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* 
 
   // Anchor the model's answer to the original and write the blend into the game's output, which
   // its post-processing reads next.
-  nr_compose::RecordPost(cmd, color, s.color_copy, s.proxy, s.output, s.out_w, s.out_h,
-                         s.eval_count, s.transfer, s.max_ratio, s.colour_strength, wp,
+  nr_compose::RecordPost(cmd, color, s.color_copy, s.proxy, s.output, s.out_w, s.out_h, out_x,
+                         out_y, s.eval_count, s.transfer, s.max_ratio, s.colour_strength, wp,
                          (uint32_t)s.debug_view);
 }
 

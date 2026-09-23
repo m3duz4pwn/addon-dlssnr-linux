@@ -19,23 +19,24 @@ void main(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= g_width || id.y >= g_height)
         return;
+    const uint2 dst = id.xy + uint2(g_out_x, g_out_y);
 
     const float3 o = max(Orig[id.xy], 0.0);
     float3 m = DecodeDisplay(Model[id.xy], g_white_point);
 
     if (g_debug == 1)
     {
-        Out[id.xy] = EncodeDisplay(o, g_white_point);
+        Out[dst] = EncodeDisplay(o, g_white_point);
         return;
     }
     if (g_debug == 2)
     {
-        Out[id.xy] = Model[id.xy];
+        Out[dst] = Model[id.xy];
         return;
     }
     if (g_debug == 3)
     {
-        Out[id.xy] = abs(m - o) * 20.0;
+        Out[dst] = abs(m - o) * 20.0;
         return;
     }
 
@@ -59,5 +60,5 @@ void main(uint3 id : SV_DispatchThreadID)
     // NaN guard: any non-finite lane falls back to the original.
     m = select(m == m, m, o);
 
-    Out[id.xy] = lerp(o, m, g_transfer);
+    Out[dst] = lerp(o, m, g_transfer);
 }

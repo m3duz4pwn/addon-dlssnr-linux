@@ -33,4 +33,6 @@ cbuffer Constants : register(b0)
     uint g_debug;         // 0 off, 1 proxy, 2 model answer, 3 difference x20
     uint g_width;
     uint g_height;
+    uint g_out_x;         // where DLSS wrote its output inside the game's texture (its subrect base)
+    uint g_out_y;
 };
