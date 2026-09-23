@@ -49,11 +49,30 @@ struct Compose {
   ID3D12Resource* readback[kReadbackRing] = {};
   uint32_t tile_count = 0;
   uint32_t buf_w = 0, buf_h = 0;
+  // The frame the current readback ring was created at: slots are only worth reading once each
+  // has been written by this ring, not what a freshly created readback heap happens to hold.
+  uint32_t readback_since = 0;
+  bool buffers_new = false;
 
   bool failed = false;
 };
 
 inline Compose c;
+
+// Where a buffer replaced at a resize goes. Frames still executing on the GPU reference the old
+// one, so nr_runner points this at its graveyard; unset, the buffer is released at once.
+using RetireFn = void (*)(ID3D12Resource*);
+inline RetireFn retire = nullptr;
+
+inline void RetireBuffer(ID3D12Resource*& r) {
+  if (r == nullptr) return;
+  if (retire != nullptr) {
+    retire(r);
+  } else {
+    r->Release();
+  }
+  r = nullptr;
+}
 
 inline void Release() {
   for (auto*& r : c.readback)
@@ -148,10 +167,12 @@ inline bool Init(ID3D12Device* device) {
 
 inline bool EnsureBuffers(ID3D12Device* device, uint32_t w, uint32_t h) {
   if (c.tile_buf != nullptr && c.buf_w == w && c.buf_h == h) return true;
-  for (auto*& r : c.readback)
-    if (r != nullptr) { r->Release(); r = nullptr; }
-  if (c.result_buf != nullptr) { c.result_buf->Release(); c.result_buf = nullptr; }
-  if (c.tile_buf != nullptr) { c.tile_buf->Release(); c.tile_buf = nullptr; }
+  // A resize: up to a few frames recorded against the old buffers are still in flight, so they
+  // are retired, not released -- releasing them here freed memory the GPU was still writing.
+  for (auto*& r : c.readback) RetireBuffer(r);
+  RetireBuffer(c.result_buf);
+  RetireBuffer(c.tile_buf);
+  c.buf_w = c.buf_h = 0;
 
   c.tile_count = ((w + 15) / 16) * ((h + 15) / 16);
 
@@ -187,6 +208,7 @@ inline bool EnsureBuffers(ID3D12Device* device, uint32_t w, uint32_t h) {
   }
   c.buf_w = w;
   c.buf_h = h;
+  c.buffers_new = true;
   return true;
 }
 
@@ -300,6 +322,10 @@ inline bool RecordPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
     device->Release();
     return false;
   }
+  if (c.buffers_new) {
+    c.readback_since = frame;
+    c.buffers_new = false;
+  }
 
   const uint32_t base = (frame % kRingSize) * kSlotsPerFrame;
   WriteSrv(device, base + 0, color_copy);
@@ -373,7 +399,7 @@ inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
 // The oldest readback slot's raw white point, or a negative number when none is ready yet. Safe
 // to call every frame; the slot being read is kReadbackRing frames old, long past GPU use.
 inline float ReadWhitePoint(uint32_t frame) {
-  if (frame < kReadbackRing || c.readback[0] == nullptr) return -1.0f;
+  if (frame < c.readback_since + kReadbackRing || c.readback[0] == nullptr) return -1.0f;
   ID3D12Resource* slot = c.readback[(frame + 1) % kReadbackRing];
   void* mapped = nullptr;
   const D3D12_RANGE read_range = {0, 4};

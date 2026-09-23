@@ -382,6 +382,7 @@ inline bool IsEnabled() { return s.enabled; }
 inline bool EnsureSetup(ID3D12GraphicsCommandList* cmd) {
   if (s.caps != nullptr && s.forwarder != nullptr) return true;
   NR_TEST_HOOKS_INIT();
+  nr_compose::retire = [](ID3D12Resource* r) { Bury(r, nullptr); };
 
   // Everything lives beside the game exe: the forwarder, the model, and our data path.
   if (s.game_dir[0] == 0) {
